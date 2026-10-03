@@ -1,0 +1,341 @@
+name: "ghav human: Playwright Tests"
+"on":
+  push:
+    branches:
+      - ghav/dev/9986
+    paths:
+      - .ghav/human
+permissions:
+  contents: read
+env:
+  NODE_MODULES_ARCHIVE: e2e-node-modules.tar.zst
+jobs:
+  deps:
+    name: Install dependencies
+    runs-on: ubuntu-26.04
+    timeout-minutes: 360
+    steps:
+      - name: "ghav: free disk on the hosted runner"
+        run: |
+          df -h / /mnt 2>/dev/null || df -h /
+          # Yarn's package cache goes to the runner's temporary disk when that is a separate mount.
+          if mountpoint -q /mnt; then
+            sudo mkdir -p /mnt/yarn-cache
+            sudo chown "$(id -u):$(id -g)" /mnt/yarn-cache
+            echo "YARN_CACHE_FOLDER=/mnt/yarn-cache" >> "$GITHUB_ENV"
+          fi
+          # Preinstalled toolchains that no step of this workflow uses.
+          for dir in /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            sudo rm -rf "$dir" &
+          done
+          wait
+          df -h /
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Packages & Bootstrap
+        shell: bash
+        run: |
+          yarn bootstrap \
+            || { echo "::warning::yarn bootstrap failed — retry 1"; yarn bootstrap; }
+      - name: Archive node_modules
+        shell: bash
+        run: |
+          set -o pipefail
+          PATHS=()
+          for p in node_modules apps/*/node_modules packages/*/node_modules \
+                   packages/plugins/*/node_modules tools/node_modules; do
+            [ -d "$p" ] && PATHS+=("$p")
+          done
+          if [ ${#PATHS[@]} -eq 0 ]; then
+            echo "::error::bootstrap produced no node_modules directories"; exit 1
+          fi
+          echo "archiving ${#PATHS[@]} directories"
+          if command -v zstd >/dev/null 2>&1; then
+            COMPRESS="zstd -3 -T0"
+          else
+            echo "::warning::zstd unavailable — falling back to gzip (larger archive, slower)"
+            COMPRESS="gzip -3"
+          fi
+          tar --warning=no-file-changed --use-compress-program="$COMPRESS" \
+              -cf "$NODE_MODULES_ARCHIVE" "${PATHS[@]}" || [ $? -eq 1 ]
+          ls -lh "$NODE_MODULES_ARCHIVE"
+          # Tolerating tar's exit 1 means a TRUNCATED archive could be published, and every
+          # downstream job would then fall back to its own multi-hour bootstrap. A cheap size floor
+          # catches the gross case; a full `tar -t` would re-read every byte for little extra.
+          size=$(stat -c%s "$NODE_MODULES_ARCHIVE")
+          echo "archive bytes: $size"
+          if [ "$size" -lt 104857600 ]; then
+            echo "::error::archive is only $size bytes — the dependency tree cannot be that small"
+            exit 1
+          fi
+      - name: Upload node_modules archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-node-modules
+          path: ${{ env.NODE_MODULES_ARCHIVE }}
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+  build:
+    name: Build API + Web
+    needs: deps
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    steps:
+      - name: "ghav: free disk on the hosted runner"
+        run: |
+          df -h / /mnt 2>/dev/null || df -h /
+          # Yarn's package cache goes to the runner's temporary disk when that is a separate mount.
+          if mountpoint -q /mnt; then
+            sudo mkdir -p /mnt/yarn-cache
+            sudo chown "$(id -u):$(id -g)" /mnt/yarn-cache
+            echo "YARN_CACHE_FOLDER=/mnt/yarn-cache" >> "$GITHUB_ENV"
+          fi
+          # Preinstalled toolchains that no step of this workflow uses.
+          for dir in /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            sudo rm -rf "$dir" &
+          done
+          wait
+          df -h /
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download node_modules archive
+        id: archive
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: e2e-node-modules
+      - name: Restore node_modules
+        shell: bash
+        run: .github/scripts/restore-node-modules.sh
+      - name: Size the Node heap to this container
+        shell: bash
+        run: |
+          # true only for a non-empty, all-digits value
+          is_number() { [ -n "$1" ] && [ -z "${1//[0-9]/}" ]; }
+
+          limit_mb=''
+          limit_bytes=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)
+          if is_number "$limit_bytes"; then limit_mb=$((limit_bytes / 1024 / 1024)); fi
+          # An unlimited cgroup reports "max" or a host-sized number — fall back to real RAM.
+          if ! is_number "$limit_mb" || [ "$limit_mb" -eq 0 ] || [ "$limit_mb" -gt 262144 ]; then
+            limit_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || true)
+          fi
+          if is_number "$limit_mb" && [ "$limit_mb" -gt 0 ]; then
+            heap_mb=$((limit_mb * 3 / 4))
+            if [ "$heap_mb" -gt 24576 ]; then heap_mb=24576; fi
+            if [ "$heap_mb" -lt 4096 ]; then heap_mb=4096; fi
+          else
+            # Neither source answered. Fall back to the heap the API has always run with rather
+            # than to the floor — this step must never be the thing that fails a build.
+            echo "::warning::could not determine this container's memory limit — defaulting the Node heap to 12288 MB"
+            heap_mb=12288
+          fi
+          echo "container memory: ${limit_mb:-unknown} MB, cpus: $(nproc 2>/dev/null || echo '?') -> node heap ${heap_mb} MB"
+          free -h || true
+          echo "NODE_OPTIONS=--max-old-space-size=${heap_mb}" >> "$GITHUB_ENV"
+          # Also published on its own so the web build can pass the flag directly on the node
+          # command line. NODE_OPTIONS alone was demonstrably not enough — see that step.
+          echo "NODE_HEAP_MB=${heap_mb}" >> "$GITHUB_ENV"
+      - name: Build all packages
+        shell: bash
+        run: |
+          yarn build:package:all --parallel=1 \
+            || { echo "::warning::build:package:all failed — retry 1 (nx cache skips built projects)"; yarn build:package:all --parallel=1; }
+        env:
+          NX_NO_CLOUD: true
+          NX_ISOLATE_PLUGINS: "false"
+          NX_DAEMON: "false"
+      - name: Generate dev config
+        run: yarn config:dev
+      - name: Build API (bundle) for the test jobs
+        shell: bash
+        run: |
+          yarn nx build api -c development --parallel=1 \
+            || { echo "::warning::api build failed — retry 1 (nx cache skips built deps)"; yarn nx build api -c development --parallel=1; }
+        env:
+          NX_NO_CLOUD: true
+          NX_ISOLATE_PLUGINS: "false"
+          NX_DAEMON: "false"
+      - name: Build Web (gauzy) for static serving
+        shell: bash
+        run: |
+          heap_mb="${NODE_HEAP_MB:-12288}"
+          echo "--- heap probe -------------------------------------------------"
+          echo "NODE_OPTIONS=${NODE_OPTIONS:-(unset)}"
+          node -e "console.log('a plain node process sees heap_size_limit =', Math.round(require('v8').getHeapStatistics().heap_size_limit/1048576), 'MB')"
+          node --max-old-space-size=$heap_mb -e "console.log('with the flag on the command line   =', Math.round(require('v8').getHeapStatistics().heap_size_limit/1048576), 'MB')"
+          echo "----------------------------------------------------------------"
+          # Drive nx through node directly so the ceiling cannot be lost in a wrapper.
+          build() { node --max-old-space-size=$heap_mb ./node_modules/nx/bin/nx.js build gauzy -c ci; }
+          build || { echo "::warning::gauzy build failed — retry 1 (nx cache skips done deps)"; build; }
+          # The bundle bakes the API URL as http://localhost:3000; the API runs on :3001 in the test
+          # job (this shared runner's :3000 is taken by other dev processes), so repoint the built
+          # bundle at :3001 BEFORE it is packed — the test job serves this artifact verbatim.
+          matches=$(grep -rl 'localhost:3000' dist/apps/gauzy --include='*.js' || true)
+          if [ -n "$matches" ]; then
+            printf '%s\n' "$matches" | xargs -r sed -i 's#localhost:3000#localhost:3001#g'
+            echo "repointed $(printf '%s\n' "$matches" | wc -l) bundle file(s) at :3001"
+          fi
+          # Assert the END STATE rather than the edit: the whole suite fails at login if the served
+          # bundle talks to the wrong port, and that must not be discovered 79 specs later.
+          if grep -rq 'localhost:3000' dist/apps/gauzy --include='*.js'; then
+            echo "::error::dist/apps/gauzy still references localhost:3000 after the rewrite"; exit 1
+          fi
+          if ! grep -rq 'localhost:3001' dist/apps/gauzy --include='*.js'; then
+            echo "::error::dist/apps/gauzy references no API URL on :3001 — the built bundle would never reach the e2e API"; exit 1
+          fi
+        env:
+          NX_NO_CLOUD: true
+          NX_ISOLATE_PLUGINS: "false"
+          NX_DAEMON: "false"
+      - name: Pack build output
+        shell: bash
+        run: |
+          tar --exclude='*.map' -cf api-dist.tar dist/apps/api
+          tar --exclude='*.map' -cf web-dist.tar dist/apps/gauzy
+          ls -lh api-dist.tar web-dist.tar
+      - name: Upload prebuilt API + Web bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-dist
+          path: |
+            api-dist.tar
+            web-dist.tar
+          retention-days: 1
+          if-no-files-found: error
+  e2e-playwright:
+    name: e2e (shard ${{ matrix.shard }})
+    needs:
+      - deps
+      - build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+          - 4
+    steps:
+      - name: "ghav: free disk on the hosted runner"
+        run: |
+          df -h / /mnt 2>/dev/null || df -h /
+          # Yarn's package cache goes to the runner's temporary disk when that is a separate mount.
+          if mountpoint -q /mnt; then
+            sudo mkdir -p /mnt/yarn-cache
+            sudo chown "$(id -u):$(id -g)" /mnt/yarn-cache
+            echo "YARN_CACHE_FOLDER=/mnt/yarn-cache" >> "$GITHUB_ENV"
+          fi
+          # Preinstalled toolchains that no step of this workflow uses.
+          for dir in /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            sudo rm -rf "$dir" &
+          done
+          wait
+          df -h /
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download node_modules archive
+        id: archive
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: e2e-node-modules
+      - name: Restore node_modules
+        shell: bash
+        run: .github/scripts/restore-node-modules.sh
+      - name: Install forever package
+        shell: bash
+        run: |
+          npm config set prefix "$HOME/.npm-global"
+          for attempt in 1 2 3; do
+            npm install forever -g && break
+            echo "::warning::npm install forever -g failed (attempt ${attempt}/3)"
+            [ "$attempt" = 3 ] && exit 1
+            sleep $((attempt * 10))
+          done
+      - name: Add npm global bin to PATH
+        shell: bash
+        run: echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+      - name: Download prebuilt API + Web bundles
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-dist
+          path: .artifacts
+      - name: Unpack prebuilt API + Web bundles
+        shell: bash
+        run: |
+          rm -rf dist/apps/api dist/apps/gauzy
+          tar -xf .artifacts/api-dist.tar
+          tar -xf .artifacts/web-dist.tar
+          test -f dist/apps/api/main.js || { echo "::error::dist/apps/api/main.js missing after unpack"; exit 1; }
+          test -f dist/apps/gauzy/index.html || { echo "::error::dist/apps/gauzy/index.html missing after unpack"; exit 1; }
+          # The bundle this job is about to serve must point at the API port this job starts.
+          if grep -rq 'localhost:3000' dist/apps/gauzy --include='*.js'; then
+            echo "::error::served web bundle still references localhost:3000 — the :3001 rewrite did not survive the build job"; exit 1
+          fi
+          echo "✅ unpacked API + web bundles (web repointed at :3001)"
+      - name: Reset DB for a clean, deterministic seed
+        shell: bash
+        run: rm -f apps/api/data/gauzy.sqlite3*
+      - name: Run API in background
+        shell: bash
+        run: forever start dist/apps/api/main.js
+        env:
+          NODE_OPTIONS: --max-old-space-size=12288
+          DEMO: "false"
+          DB_TYPE: better-sqlite3
+          API_PORT: "3001"
+          API_BASE_URL: http://localhost:3001
+      - name: Serve Web (static) in background
+        run: forever start apps/gauzy-e2e/tools/serve-web.js dist/apps/gauzy 4200
+      - name: Install Playwright browser (chromium)
+        shell: bash
+        run: |
+          npx playwright install --with-deps chromium \
+            || { echo "::warning::playwright install --with-deps failed (no sudo/apt?) — installing the browser only"; npx playwright install chromium; }
+      - name: Wait for API and Web to be ready
+        shell: bash
+        run: |
+          deadline=$((SECONDS + 600))   # 10 min hard cap
+          while (( SECONDS < deadline )); do
+            api=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:3001/api || true)
+            web=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:4200 || true)
+            echo "waiting (${SECONDS}s): api=$api web=$web"
+            if [ "$api" != "000" ] && [ "$web" != "000" ]; then
+              echo "✅ API (:3001) and Web (:4200) are up"; exit 0
+            fi
+            if npx forever list 2>/dev/null | grep -qi "STOPPED"; then
+              echo "❌ A server process crashed (forever reports STOPPED) — aborting early."; exit 1
+            fi
+            sleep 6
+          done
+          echo "❌ Timed out after ${SECONDS}s waiting for API/Web"; exit 1
+      - name: Server logs (diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          npx forever list || true
+          for f in "$HOME"/.forever/*.log; do
+            [ -e "$f" ] || continue
+            echo "===== $f ====="
+            tail -120 "$f" || true
+          done
+      - name: Run Playwright tests
+        working-directory: apps/gauzy-e2e
+        shell: bash
+        timeout-minutes: 75
+        run: npx bddgen && npx playwright test --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+        env:
+          CI: "true"
+          E2E_BASE_URL: http://localhost:4200
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-shard-${{ matrix.shard }}
+          path: apps/gauzy-e2e/playwright-report
+          retention-days: 14
